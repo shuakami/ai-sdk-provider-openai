@@ -1,0 +1,40 @@
+{
+  "name": "@sdjz/ai-sdk-provider-openai",
+  "version": "0.1.0",
+  "description": "OpenAI provider for @sdjz/ai-sdk, compatible with OpenAI-style baseURL endpoints.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "sdk",
+    "openai",
+    "provider",
+    "llm"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shuakami/ai-sdk-provider-openai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shuakami/ai-sdk-provider-openai/issues"
+  },
+  "homepage": "https://github.com/shuakami/ai-sdk-provider-openai#readme"
+}
