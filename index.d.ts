@@ -10,18 +10,29 @@ export interface OpenAIProviderOptions {
 }
 
 export interface ChatRequest {
-  messages?: Array<{ role: string; content: string | unknown[]; name?: string }>
+  messages?: Array<{
+    role: string
+    content: string | unknown[]
+    name?: string
+    callId?: string
+    toolCalls?: Array<{ name: string; args: Record<string, unknown>; callId?: string }>
+    reasoningContent?: string
+    reasoning_content?: string
+  }>
   tools?: Array<{ name: string; description?: string; schema?: unknown }>
   toolChoice?: 'auto' | 'required' | { name: string }
   parallel?: boolean
   /** Override the default model for this request */
   model?: string
+  [key: string]: any
 }
 
 export interface ChatResponse {
   text: string
   usage?: { input: number; output: number; total: number }
   toolCalls?: Array<{ name: string; args: Record<string, unknown>; callId?: string }> | null
+  reasoningContent?: string
+  reasoning_content?: string
 }
 
 export interface StreamChunk {

@@ -60,6 +60,243 @@ function zodToJsonSchema(z) {
   return {}
 }
 
+function getReasoningContent(message) {
+  if (typeof message?.reasoningContent === 'string') return message.reasoningContent
+  if (typeof message?.reasoning_content === 'string') return message.reasoning_content
+  return undefined
+}
+
+function applyRequestExtras(body, request, reservedKeys) {
+  for (const [key, value] of Object.entries(request || {})) {
+    if (reservedKeys.has(key) || value === undefined) continue
+    body[key] = value
+  }
+}
+
+function stringifyContent(content) {
+  return typeof content === 'string' ? content : JSON.stringify(content)
+}
+
+function mapMessage(message) {
+  const reasoningContent = getReasoningContent(message)
+
+  if (message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0) {
+    return {
+      role: 'assistant',
+      content: message.content || null,
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+      tool_calls: message.toolCalls.map(tc => ({
+        id: tc.callId || `call_${Math.random().toString(36).slice(2, 10)}`,
+        type: 'function',
+        function: {
+          name: tc.name,
+          arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
+        },
+      })),
+    }
+  }
+
+  if (message.role === 'tool') {
+    return {
+      role: 'tool',
+      tool_call_id: message.callId || message.tool_call_id || 'unknown',
+      content: stringifyContent(message.content),
+    }
+  }
+
+  return {
+    role: message.role,
+    content: stringifyContent(message.content),
+    ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+    ...(message.name ? { name: message.name } : {}),
+  }
+}
+
+function applyTools(body, tools, toolChoice) {
+  if (!tools || tools.length === 0) return
+
+  body.tools = tools.map(t => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description || '',
+      parameters: toJsonSchema(t.schema),
+    },
+  }))
+
+  if (toolChoice) {
+    if (typeof toolChoice === 'string') {
+      body.tool_choice = toolChoice
+    } else if (toolChoice.name) {
+      body.tool_choice = { type: 'function', function: { name: toolChoice.name } }
+    }
+  }
+}
+
+function buildChatBody(request, model, options = {}) {
+  const body = {
+    model,
+    messages: (request?.messages || []).map(mapMessage),
+  }
+
+  if (request?.maxTokens) {
+    body.max_tokens = request.maxTokens
+  }
+
+  applyTools(body, request?.tools, request?.toolChoice)
+
+  if (options.stream === true) {
+    body.stream = true
+    body.stream_options = { include_usage: true }
+  }
+
+  applyRequestExtras(
+    body,
+    request,
+    new Set(['messages', 'tools', 'toolChoice', 'parallel', 'model', 'maxTokens', 'stream', 'stream_options']),
+  )
+
+  return body
+}
+
+function toUsage(usage) {
+  return usage ? {
+    input: usage.prompt_tokens || 0,
+    output: usage.completion_tokens || 0,
+    total: usage.total_tokens || 0,
+  } : undefined
+}
+
+function parseToolArgs(rawArgs) {
+  if (!rawArgs) return {}
+  try {
+    return JSON.parse(rawArgs)
+  } catch {
+    return {}
+  }
+}
+
+function mergeToolCallDelta(accumulator, parts) {
+  for (const part of parts || []) {
+    const index = typeof part.index === 'number' ? part.index : accumulator.length
+    if (!accumulator[index]) {
+      accumulator[index] = {
+        id: '',
+        name: '',
+        arguments: '',
+      }
+    }
+
+    if (part.id) accumulator[index].id = part.id
+    if (part.function?.name) accumulator[index].name = part.function.name
+    if (typeof part.function?.arguments === 'string') {
+      accumulator[index].arguments += part.function.arguments
+    }
+  }
+}
+
+function finalizeToolCalls(toolCalls) {
+  const normalized = toolCalls
+    .filter(Boolean)
+    .map(tc => ({
+      name: tc.name,
+      args: parseToolArgs(tc.arguments),
+      callId: tc.id,
+    }))
+    .filter(tc => tc.name)
+
+  return normalized.length > 0 ? normalized : null
+}
+
+function ensureToolReasoningCompatibility(result, request, baseURL) {
+  const needsCompatibility = Boolean(
+    result?.toolCalls &&
+    result.toolCalls.length > 0 &&
+    request?.reasoning?.enabled !== false &&
+    baseURL !== 'https://api.openai.com/v1',
+  )
+
+  if (!needsCompatibility || result.reasoningContent || result.reasoning_content) {
+    return result
+  }
+
+  const fallbackReasoning = (result.text || '').trim() || 'Compatibility placeholder for missing reasoning_content in assistant tool call.'
+
+  return {
+    ...result,
+    reasoningContent: fallbackReasoning,
+    reasoning_content: fallbackReasoning,
+  }
+}
+
+async function collectStreamChatResponse(resp) {
+  const reader = resp.body?.getReader?.()
+  if (!reader) throw new Error('Stream response body is not readable')
+
+  const decoder = new TextDecoder()
+  const toolCalls = []
+  let buffer = ''
+  let text = ''
+  let reasoningContent = ''
+  let usage
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed || !trimmed.startsWith('data: ')) continue
+      const data = trimmed.slice(6)
+      if (data === '[DONE]') {
+        return {
+          text,
+          usage,
+          toolCalls: finalizeToolCalls(toolCalls),
+          ...(reasoningContent ? { reasoningContent, reasoning_content: reasoningContent } : {}),
+        }
+      }
+
+      let parsed
+      try {
+        parsed = JSON.parse(data)
+      } catch {
+        continue
+      }
+
+      if (parsed.usage) {
+        usage = toUsage(parsed.usage)
+      }
+
+      const delta = parsed.choices?.[0]?.delta
+      if (!delta) continue
+
+      if (typeof delta.content === 'string') {
+        text += delta.content
+      }
+
+      if (typeof delta.reasoning_content === 'string') {
+        reasoningContent += delta.reasoning_content
+      }
+
+      if (Array.isArray(delta.tool_calls)) {
+        mergeToolCallDelta(toolCalls, delta.tool_calls)
+      }
+    }
+  }
+
+  return {
+    text,
+    usage,
+    toolCalls: finalizeToolCalls(toolCalls),
+    ...(reasoningContent ? { reasoningContent, reasoning_content: reasoningContent } : {}),
+  }
+}
+
 export function openai(options) {
   const apiKey = options.apiKey
   const defaultModel = options.model || 'gpt-4o-mini'
@@ -83,71 +320,19 @@ export function openai(options) {
     async chat(request, signal) {
       const messages = request?.messages || []
       const tools = request?.tools
-      const toolChoice = request?.toolChoice
       // Support per-request model override
       const model = request?.model || defaultModel
-
-      const body = {
-        model,
-        messages: messages.map(m => {
-          // Assistant message with toolCalls -> convert to OpenAI tool_calls format
-          if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-            return {
-              role: 'assistant',
-              content: m.content || null,
-              tool_calls: m.toolCalls.map(tc => ({
-                id: tc.callId || `call_${Math.random().toString(36).slice(2, 10)}`,
-                type: 'function',
-                function: {
-                  name: tc.name,
-                  arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
-                },
-              })),
-            }
-          }
-          // Tool message -> add tool_call_id
-          if (m.role === 'tool') {
-            return {
-              role: 'tool',
-              tool_call_id: m.callId || m.tool_call_id || 'unknown',
-              content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-            }
-          }
-          // Regular message
-          return {
-            role: m.role,
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-            ...(m.name ? { name: m.name } : {}),
-          }
-        }),
-      }
-
-      // Support maxTokens
-      if (request?.maxTokens) {
-        body.max_tokens = request.maxTokens
-      }
-
-      if (tools && tools.length > 0) {
-        body.tools = tools.map(t => ({
-          type: 'function',
-          function: {
-            name: t.name,
-            description: t.description || '',
-            parameters: toJsonSchema(t.schema),
-          },
-        }))
-        if (toolChoice) {
-          if (typeof toolChoice === 'string') {
-            body.tool_choice = toolChoice
-          } else if (toolChoice.name) {
-            body.tool_choice = { type: 'function', function: { name: toolChoice.name } }
-          }
-        }
-      }
+      const shouldUseStreamForTools = Boolean(
+        tools &&
+        tools.length > 0 &&
+        request?.reasoning?.enabled !== false &&
+        baseURL !== 'https://api.openai.com/v1',
+      )
+      const body = buildChatBody(request, model, { stream: shouldUseStreamForTools })
 
       let resp
       const startTime = Date.now()
-      log('req', `chat model=${model} messages=${messages.length}${tools ? ` tools=${tools.length}` : ''}`)
+      log('req', `chat model=${model} messages=${messages.length}${tools ? ` tools=${tools.length}` : ''}${shouldUseStreamForTools ? ' mode=stream-tools' : ''}`)
       try {
         resp = await fetch(`${baseURL}/chat/completions`, {
           method: 'POST',
@@ -242,9 +427,21 @@ export function openai(options) {
         throw err
       }
 
+      if (shouldUseStreamForTools) {
+        const result = ensureToolReasoningCompatibility(
+          await collectStreamChatResponse(resp),
+          request,
+          baseURL,
+        )
+        const latency = Date.now() - startTime
+        log('ok', `chat(stream) ${latency}ms tokens=${result.usage?.total || 'N/A'}${result.toolCalls ? ` tools=${result.toolCalls.length}` : ''}${result.reasoningContent ? ` reasoning=${result.reasoningContent.length}` : ''}`)
+        return result
+      }
+
       const json = await resp.json()
       const choice = json.choices?.[0]
       const message = choice?.message
+      const reasoningContent = getReasoningContent(message)
 
       const toolCalls = message?.tool_calls?.map(tc => ({
         name: tc.function?.name,
@@ -255,15 +452,12 @@ export function openai(options) {
       const latency = Date.now() - startTime
       log('ok', `chat ${latency}ms tokens=${json.usage?.total_tokens || 'N/A'}${toolCalls ? ` tools=${toolCalls.length}` : ''}`)
 
-      return {
+      return ensureToolReasoningCompatibility({
         text: message?.content || '',
-        usage: json.usage ? {
-          input: json.usage.prompt_tokens || 0,
-          output: json.usage.completion_tokens || 0,
-          total: json.usage.total_tokens || 0,
-        } : undefined,
+        usage: toUsage(json.usage),
         toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : null,
-      }
+        ...(reasoningContent ? { reasoningContent, reasoning_content: reasoningContent } : {}),
+      }, request, baseURL)
     },
 
     async *stream(request, signal) {
@@ -271,18 +465,7 @@ export function openai(options) {
       const model = request?.model || defaultModel
 
       const body = {
-        model,
-        messages: messages.map(m => ({
-          role: m.role,
-          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-        })),
-        stream: true,
-        stream_options: { include_usage: true },
-      }
-
-      // Support maxTokens
-      if (request?.maxTokens) {
-        body.max_tokens = request.maxTokens
+        ...buildChatBody(request, model, { stream: true }),
       }
 
       let resp
